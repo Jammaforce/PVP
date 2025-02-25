@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cube PVP Game - P2P</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+        #connection { position: absolute; top: 10px; left: 10px; }
+    </style>
+</head>
+<body>
+    <div id="connection">
+        <input id="offerInput" placeholder="Paste offer here">
+        <button onclick="connect()">Connect</button>
+        <p>Your offer: <span id="myOffer"></span></p>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
+    <script>
+        // Scene setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // Player class
+        class Player {
+            constructor(color, startX, isLocal = false) {
+                this.geometry = new THREE.BoxGeometry(1, 1, 1);
+                this.material = new THREE.MeshBasicMaterial({ color: color });
+                this.cube = new THREE.Mesh(this.geometry, this.material);
+                this.cube.position.x = startX;
+                this.cube.position.y = 0.5;
+                this.velocity = new THREE.Vector3(0, 0, 0);
+                this.health = 4;
+                this.canShoot = true;
+                this.speed = 0.1;
+                this.isLocal = isLocal;
+                scene.add(this.cube);
+            }
+
+            shoot(target) {
+                if (!this.canShoot) return;
+                const bulletGeometry = new THREE.SphereGeometry(0.1, 8, 8);
+                const bulletMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+                const bullet = new THREE.Mesh(bulletGeometry, bulletMaterial);
+                bullet.position.copy(this.cube.position);
+                
+                const direction = new THREE.Vector3();
+                target.cube.getWorldPosition(direction);
+                direction.sub(this.cube.position).normalize();
+                
+                bullet.userData = { velocity: direction.multiplyScalar(0.5), source: this };
+                scene.add(bullet);
+                
+                this.canShoot = false;
+                setTimeout(() => this.canShoot = true, 2000);
+
+                if (this.isLocal && dataChannel) {
+                    dataChannel.send(JSON.stringify({
+                        type: 'shoot',
+                        position: this.cube.position,
+                        direction: direction
+                    }));
+                }
+            }
+
+            updatePosition(x, z, y) {
+                if (!this.isLocal) {
+                    this.cube.position.set(x, y, z);
+                }
+            }
+        }
+
+        // Create players
+        const localPlayer = new Player(0xff0000, -5, true);  // Red, you
+        const remotePlayer = new Player(0x0000ff, 5, false); // Blue, friend
+
+        // Ground and walls (same as before)
+        const groundGeometry = new THREE.PlaneGeometry(20, 20);
+        const groundMaterial = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+        const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        const wallGeometry = new THREE.BoxGeometry(20, 2, 0.2);
+        const wallMaterial = new THREE.MeshBasicMaterial({ color: 0x888888 });
+        const walls = [
+            new THREE.Mesh(wallGeometry, wallMaterial),
+            new THREE.Mesh(wallGeometry, wallMaterial),
+            new THREE.Mesh(new THREE.BoxGeometry(0.2, 2, 20), wallMaterial),
+            new THREE.Mesh(new THREE.BoxGeometry(0.2, 2, 20), wallMaterial)
+        ];
+        walls[0].position.set(0, 1, -10);
+        walls[1].position.set(0, 1, 10);
+        walls[2].position.set(-10, 1, 0);
+        walls[3].position.set(10, 1, 0);
+        walls.forEach(wall => scene.add(wall));
+
+        // Camera
+        camera.position.set(0, 15, 15);
+        camera.lookAt(0, 0, 0);
+
+        // Controls
+        const keys = {};
+        document.addEventListener('keydown', (e) => keys[e.key.toLowerCase()] = true);
+        document.addEventListener('keyup', (e) => keys[e.key.toLowerCase()] = false);
+        document.addEventListener('click', () => localPlayer.shoot(remotePlayer));
+
+        let mouseX = 0;
+        document.addEventListener('mousemove', (e) => {
+            mouseX = (e.clientX / window.innerWidth) * 2 - 1;
+        });
+
+        // WebRTC setup
+        const peer = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        let dataChannel = null;
+
+        peer.onicecandidate = (event) => {
+            if (event.candidate) {
+                const offer = JSON.stringify(peer.localDescription);
+                document.getElementById('myOffer').textContent = offer;
+            }
+        };
+
+        peer.ondatachannel = (event) => {
+            dataChannel = event.channel;
+            setupDataChannel();
+        };
+
+        function setupDataChannel() {
+            dataChannel.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'position') {
+                    remotePlayer.updatePosition(data.x, data.z, data.y);
+                } else if (data.type === 'shoot') {
+                    // Handle remote player's shot (create bullet locally)
+                    const bulletGeometry = new THREE.SphereGeometry(0.1, 8, 8);
+                    const bulletMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+                    const bullet = new THREE.Mesh(bulletGeometry, bulletMaterial);
+                    bullet.position.copy(data.position);
+                    bullet.userData = { velocity: new THREE.Vector3().copy(data.direction).multiplyScalar(0.5), source: remotePlayer };
+                    scene.add(bullet);
+                }
+            };
+        }
+
+        async function createOffer() {
+            dataChannel = peer.createDataChannel('game');
+            setupDataChannel();
+            const offer = await peer.createOffer();
+            await peer.setLocalDescription(offer);
+        }
+
+        async function connect() {
+            const offerInput = document.getElementById('offerInput').value;
+            if (!offerInput) return;
+
+            const remoteDesc = JSON.parse(offerInput);
+            await peer.setRemoteDescription(remoteDesc);
+
+            if (remoteDesc.type === 'offer') {
+                const answer = await peer.createAnswer();
+                await peer.setLocalDescription(answer);
+                document.getElementById('myOffer').textContent = JSON.stringify(answer);
+            }
+        }
+
+        createOffer(); // Start as host
+
+        // Game loop
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Local player movement
+            if (keys['w'] && localPlayer.cube.position.z > -9.5) localPlayer.cube.position.z -= localPlayer.speed;
+            if (keys['s'] && localPlayer.cube.position.z < 9.5) localPlayer.cube.position.z += localPlayer.speed;
+            if (keys['a'] && localPlayer.cube.position.x > -9.5) localPlayer.cube.position.x -= localPlayer.speed;
+            if (keys['d'] && localPlayer.cube.position.x < 9.5) localPlayer.cube.position.x += localPlayer.speed;
+            if (keys[' '] && localPlayer.cube.position.y <= 0.5) localPlayer.velocity.y = 0.3;
+
+            // Gravity
+            localPlayer.velocity.y -= 0.015;
+            localPlayer.cube.position.y += localPlayer.velocity.y;
+            if (localPlayer.cube.position.y < 0.5) {
+                localPlayer.cube.position.y = 0.5;
+                localPlayer.velocity.y = 0;
+            }
+
+            // Send position to remote player
+            if (dataChannel && dataChannel.readyState === 'open') {
+                dataChannel.send(JSON.stringify({
+                    type: 'position',
+                    x: localPlayer.cube.position.x,
+                    z: localPlayer.cube.position.z,
+                    y: localPlayer.cube.position.y
+                }));
+            }
+
+            // Bullet handling
+            scene.children.forEach(obj => {
+                if (obj.geometry instanceof THREE.SphereGeometry) {
+                    obj.position.add(obj.userData.velocity);
+                    const target = obj.userData.source === localPlayer ? remotePlayer : localPlayer;
+                    if (obj.position.distanceTo(target.cube.position) < 0.6) {
+                        target.health--;
+                        scene.remove(obj);
+                        if (target.health <= 0) {
+                            alert(`${target === localPlayer ? 'Friend' : 'You'} wins!`);
+                            localPlayer.health = 4;
+                            remotePlayer.health = 4;
+                            localPlayer.cube.position.set(-5, 0.5, 0);
+                            remotePlayer.cube.position.set(5, 0.5, 0);
+                        }
+                    }
+                    if (Math.abs(obj.position.x) > 10 || Math.abs(obj.position.z) > 10) scene.remove(obj);
+                }
+            });
+
+            // Aim with mouse
+            const targetX = mouseX * 10;
+            const direction = new THREE.Vector3(targetX - localPlayer.cube.position.x, 0, 0);
+            localPlayer.cube.lookAt(localPlayer.cube.position.clone().add(direction));
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
